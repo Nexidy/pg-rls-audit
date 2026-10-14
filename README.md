@@ -15,7 +15,8 @@ a policy or a setting. Every finding comes with the statement that fixes it.
 
 | Severity | Check | What it means |
 |---|---|---|
-| HIGH | `rls_off_exposed` | An untrusted role can read or write a table that has no row-level security at all. |
+| HIGH | `rls_off_exposed` | An untrusted role can read or write a table that has no row-level security at all — through a table-level grant or a column-level one (`GRANT SELECT (email) ON t TO anon`). |
+| HIGH | `rls_off_via_view` | A view runs as its owner over a table with RLS **off**: granting the view serves every row of that table, even though the table itself is granted to no one. |
 | HIGH | `view_bypasses_rls` | A view over an RLS table runs as its owner (no `security_invoker`), so the policies are skipped. |
 | HIGH | `matview_bypasses_rls` | A materialized view never applies RLS; one built over an RLS table is readable by clients. |
 | HIGH | `policy_always_true` | A permissive `USING (true)` / `WITH CHECK (true)` policy — OR-ed with the rest, it opens every row. |
@@ -25,18 +26,18 @@ a policy or a setting. Every finding comes with the statement that fixes it.
 | MEDIUM | `policy_per_row_auth_call` | `auth.uid()` called directly in a policy is evaluated for every row; `(select auth.uid())` once. |
 | LOW | `rls_without_policies` | RLS on with no policy: non-owners see nothing. Intended, or a forgotten policy? |
 
+Grants are read from both the table ACL and every column ACL, and views are followed through views and
+materialized views stacked on each other to any depth (a cycle made with `CREATE OR REPLACE VIEW` stops the walk, it
+does not loop): `v2 → v1 → secret` is reported on `v2` when only `v2` is granted, with the whole chain in the detail
+and an `ALTER VIEW … SET (security_invoker = true)` for every owner-run link in the fix.
+
 The last result set counts what it read: tables, tables with RLS, policies and `SECURITY DEFINER` functions.
 
 **Tested** against a scratch database with one planted defect per check, each beside a clean look-alike (a
-`security_invoker` view, a pinned definer, a wrapped `auth.uid()`) that must not be reported.
+`security_invoker` view, a chain of `security_invoker` views, a pinned definer, a wrapped `auth.uid()`, a column
+grant on a table with RLS on) that must not be reported.
 
 By [Nexidy](https://nexidy.com).
-
-## Known limits
-
-- A view over a table with RLS **off**, granted to an untrusted role while the table itself is not, is not reported.
-- Views stacked on views are followed one level deep: `v2 → v1 → secret` is missed when only `v2` is granted.
-- Column-level grants (`GRANT SELECT (email) ON t TO anon`) are not read — only table-level ACLs.
 
 ## Run the tests
 

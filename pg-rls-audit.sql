@@ -3,8 +3,8 @@
 --   psql -X -d <database> -f pg-rls-audit.sql                        # roles treated as untrusted: anon,authenticated
 --   psql -X -d <database> -v exposed_roles=web_anon,app_user -f pg-rls-audit.sql
 --
--- It reads only the system catalogs (pg_class, pg_policy, pg_proc, pg_rewrite, pg_depend) inside a READ ONLY
--- transaction: it cannot change a row, a policy or a setting. PostgreSQL 15+ (security_invoker views, regexp_count).
+-- It reads only the system catalogs (pg_class, pg_attribute, pg_policy, pg_proc, pg_rewrite, pg_depend) inside a
+-- READ ONLY transaction: it cannot change a row, a policy or a setting. PostgreSQL 15+ (security_invoker views, regexp_count).
 -- "Exposed" means PUBLIC or one of the exposed roles (Supabase's anon/authenticated by default) holds the privilege.
 
 \if :{?exposed_roles}
@@ -17,26 +17,36 @@
 BEGIN TRANSACTION READ ONLY;
 SET LOCAL search_path = pg_catalog;
 
-WITH named AS (
+WITH RECURSIVE named AS (
     SELECT DISTINCT btrim(x) AS rolname FROM unnest(string_to_array(:'exposed_roles', ',')) x WHERE btrim(x) <> ''
 ), exposed AS (                                  -- the named roles AND every role whose privileges they inherit
     SELECT DISTINCT g.oid, g.rolname FROM named n JOIN pg_roles r ON r.rolname = n.rolname
     JOIN pg_roles g ON pg_has_role(r.oid, g.oid, 'USAGE')
 ), rel AS (
     SELECT c.oid, c.relkind, n.nspname, c.relname, c.relrowsecurity AS rls, c.relforcerowsecurity AS forced,
-           coalesce(c.relacl, acldefault('r', c.relowner)) AS relacl, c.reloptions, o.rolsuper OR o.rolbypassrls AS owner_bypasses
+           coalesce(c.relacl, acldefault('r', c.relowner)) AS relacl, c.reloptions, o.rolsuper OR o.rolbypassrls AS owner_bypasses,
+           c.relkind = 'v' AND EXISTS (SELECT 1 FROM unnest(c.reloptions) opt
+                                       WHERE lower(opt) ~ '^security_invoker=(true|on|1|yes|y|t)$') AS invoker
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     JOIN pg_roles o ON o.oid = c.relowner
     WHERE c.relkind IN ('r', 'p', 'v', 'm')
       AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\_%'
-), grants AS (                                   -- table/view privileges held by PUBLIC or an exposed role
-    SELECT r.oid, CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE e.rolname END AS who,
-           CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(e.rolname) END AS who_sql, a.privilege_type AS priv
-    FROM rel r
-    CROSS JOIN LATERAL aclexplode(r.relacl) a
+), acl AS (                                      -- table-level ACLs, and column-level ones (GRANT SELECT (email) ...)
+    SELECT r.oid, NULL::name AS col, r.relacl AS acl FROM rel r
+    UNION ALL
+    SELECT a.attrelid, a.attname, a.attacl FROM pg_attribute a JOIN rel r ON r.oid = a.attrelid
+    WHERE a.attnum > 0 AND NOT a.attisdropped AND a.attacl IS NOT NULL
+), grants AS (                                   -- table/view privileges held by PUBLIC or an exposed role, on the
+    SELECT x.oid, CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE e.rolname END AS who,   -- whole relation or some columns
+           CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(e.rolname) END AS who_sql, a.privilege_type AS priv,
+           a.privilege_type || CASE WHEN bool_or(x.col IS NULL) THEN ''          -- a table-level grant covers every column
+               ELSE ' (' || string_agg(DISTINCT quote_ident(x.col), ', ') || ')' END AS priv_desc
+    FROM acl x
+    CROSS JOIN LATERAL aclexplode(x.acl) a
     LEFT JOIN exposed e ON e.oid = a.grantee
     WHERE a.privilege_type IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE') AND (a.grantee = 0 OR e.oid IS NOT NULL)
+    GROUP BY x.oid, a.grantee, e.rolname, a.privilege_type
 ), pol AS (
     SELECT p.polrelid, p.polname, p.polpermissive,
            coalesce(pg_get_expr(p.polqual, p.polrelid), '') AS using_expr,
@@ -50,13 +60,31 @@ WITH named AS (
                AS callable_by_exposed       -- a NULL acl means the default: EXECUTE granted to PUBLIC
     FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
     WHERE p.prosecdef AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\_%'
-), view_on_rls AS (                              -- views and materialized views that read an RLS-protected table
-    SELECT DISTINCT v.oid AS view_oid, t.nspname || '.' || t.relname AS base
-    FROM rel v
-    JOIN pg_rewrite rw ON rw.ev_class = v.oid
+), dep AS (                                      -- a view or materialized view -> each relation its query reads
+    SELECT DISTINCT rw.ev_class AS src, d.refobjid AS dst
+    FROM pg_rewrite rw
     JOIN pg_depend d ON d.classid = 'pg_rewrite'::regclass AND d.objid = rw.oid AND d.refclassid = 'pg_class'::regclass
-    JOIN rel t ON t.oid = d.refobjid AND t.rls AND t.oid <> v.oid
+    WHERE d.refobjid <> rw.ev_class
+), reach AS (                                    -- followed through views stacked on views to any depth; path holds
+    SELECT v.oid AS top, d.dst AS node, ARRAY[v.oid] AS path   -- the views walked so far, so a cycle stops
+    FROM rel v JOIN dep d ON d.src = v.oid
     WHERE v.relkind IN ('v', 'm')
+    UNION ALL
+    SELECT r.top, d.dst, r.path || r.node
+    FROM reach r JOIN rel n ON n.oid = r.node AND n.relkind IN ('v', 'm') JOIN dep d ON d.src = r.node
+    WHERE d.dst <> ALL (r.path || r.node)
+), view_on_table AS (                            -- every table a view reads, the chain it reads it through, and each
+    SELECT r.top AS view_oid, t.rls,                                 -- owner-run view below the top one on that chain
+           format('%I.%I', t.nspname, t.relname) || coalesce(' via ' || (
+               SELECT string_agg(format('%I.%I', m.nspname, m.relname), ' → ' ORDER BY u.i)
+               FROM unnest(r.path[2:]) WITH ORDINALITY u(oid, i) JOIN rel m ON m.oid = u.oid), '') AS base,
+           format('%I.%I', t.nspname, t.relname) AS base_name,
+           CASE WHEN m.oid IS NOT NULL
+                THEN format('ALTER VIEW %I.%I SET (security_invoker = true);', m.nspname, m.relname) END AS fix_below
+    FROM reach r
+    JOIN rel t ON t.oid = r.node AND t.relkind IN ('r', 'p')
+    LEFT JOIN LATERAL unnest(r.path[2:]) u(oid) ON true
+    LEFT JOIN rel m ON m.oid = u.oid AND m.relkind = 'v' AND NOT m.invoker
 ), findings AS (
     SELECT 1 AS sev, 'exposed_role_missing' AS check_name, coalesce(n.rolname, '(none named)') AS object,
            'no such role: nothing it can reach was checked' AS detail, 'pass -v exposed_roles=<existing roles>' AS fix
@@ -65,20 +93,36 @@ WITH named AS (
     UNION ALL
     -- 1. an exposed role can read or write a table that has no row-level security at all
     SELECT 1, 'rls_off_exposed', format('%I.%I', r.nspname, r.relname),
-           'RLS is OFF; ' || string_agg(DISTINCT g.who || ':' || g.priv, ', ') ,
+           'RLS is OFF; ' || string_agg(DISTINCT g.who || ':' || g.priv_desc, ', '),
            format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY; then write its policies', r.nspname, r.relname)
     FROM rel r JOIN grants g ON g.oid = r.oid
     WHERE r.relkind IN ('r', 'p') AND NOT r.rls
     GROUP BY r.nspname, r.relname
 
     UNION ALL  -- 2. a view that runs as its owner over an RLS table, readable by an exposed role: the policies are skipped
+    --         (also through views stacked on views: v2 -> v1 -> secret with only v2 granted)
     SELECT 1, 'view_bypasses_rls', format('%I.%I', r.nspname, r.relname),
            'reads ' || string_agg(DISTINCT vr.base, ', ') || ' as its owner; readable by '
                || string_agg(DISTINCT g.who, ', '),
            format('ALTER VIEW %I.%I SET (security_invoker = true);', r.nspname, r.relname)
-    FROM rel r JOIN view_on_rls vr ON vr.view_oid = r.oid JOIN grants g ON g.oid = r.oid AND g.priv = 'SELECT'
-    WHERE r.relkind = 'v'
-      AND NOT EXISTS (SELECT 1 FROM unnest(r.reloptions) o WHERE lower(o) ~ '^security_invoker=(true|on|1|yes|y|t)$')
+               || coalesce(' ' || string_agg(DISTINCT vr.fix_below, ' '), '')
+    FROM rel r JOIN view_on_table vr ON vr.view_oid = r.oid AND vr.rls
+    JOIN grants g ON g.oid = r.oid AND g.priv = 'SELECT'
+    WHERE r.relkind = 'v' AND NOT r.invoker
+    GROUP BY r.nspname, r.relname
+
+    UNION ALL  -- 2b. a view that runs as its owner over a table with RLS OFF, readable by an exposed role: every row of
+               --     that table is served, even when the table itself is granted to no one
+    SELECT 1, 'rls_off_via_view', format('%I.%I', r.nspname, r.relname),
+           'reads ' || string_agg(DISTINCT vr.base, ', ') || ' as its owner, and RLS is OFF there; readable by '
+               || string_agg(DISTINCT g.who, ', '),
+           string_agg(DISTINCT format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY;', vr.base_name), ' ') || ' '
+               || format('ALTER VIEW %I.%I SET (security_invoker = true);', r.nspname, r.relname)
+               || coalesce(' ' || string_agg(DISTINCT vr.fix_below, ' '), '')
+               || ' then write its policies and grant the view''s readers SELECT on what it reads'
+    FROM rel r JOIN view_on_table vr ON vr.view_oid = r.oid AND NOT vr.rls
+    JOIN grants g ON g.oid = r.oid AND g.priv = 'SELECT'
+    WHERE r.relkind = 'v' AND NOT r.invoker
     GROUP BY r.nspname, r.relname
 
     UNION ALL  -- 3. a materialized view never applies RLS, so one over an RLS table must not be readable by clients
@@ -87,7 +131,8 @@ WITH named AS (
                || string_agg(DISTINCT g.who, ', '),
            format('REVOKE SELECT ON %I.%I FROM %s; serve it through a security_invoker view or a checked function',
                   r.nspname, r.relname, string_agg(DISTINCT g.who_sql, ', '))
-    FROM rel r JOIN view_on_rls vr ON vr.view_oid = r.oid JOIN grants g ON g.oid = r.oid AND g.priv = 'SELECT'
+    FROM rel r JOIN view_on_table vr ON vr.view_oid = r.oid AND vr.rls
+    JOIN grants g ON g.oid = r.oid AND g.priv = 'SELECT'
     WHERE r.relkind = 'm'
     GROUP BY r.nspname, r.relname
 
