@@ -53,6 +53,18 @@ WITH RECURSIVE named AS (
            coalesce(pg_get_expr(p.polwithcheck, p.polrelid), '') AS check_expr,
            0 = ANY (p.polroles) OR EXISTS (SELECT 1 FROM exposed e WHERE e.oid = ANY (p.polroles)) AS for_exposed
     FROM pg_policy p
+), pol_cmd AS (                                  -- each PERMISSIVE policy, once per role and command it applies to
+    SELECT p.polrelid, p.polname, CASE WHEN pr.oid = 0 THEN 'PUBLIC' ELSE coalesce(ro.rolname, pr.oid::text) END AS who, c.cmd
+    FROM pg_policy p
+    CROSS JOIN LATERAL unnest(p.polroles) pr(oid)
+    LEFT JOIN pg_roles ro ON ro.oid = pr.oid
+    CROSS JOIN LATERAL unnest(CASE p.polcmd WHEN 'r' THEN ARRAY['SELECT'] WHEN 'a' THEN ARRAY['INSERT']
+                                            WHEN 'w' THEN ARRAY['UPDATE'] WHEN 'd' THEN ARRAY['DELETE']
+                                            ELSE ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE'] END) c(cmd)   -- FOR ALL
+    WHERE p.polpermissive
+), overlap AS (                                  -- a role and a command that more than one permissive policy covers
+    SELECT polrelid, who, cmd, string_agg(quote_ident(polname), ', ' ORDER BY polname) AS policies
+    FROM pol_cmd GROUP BY polrelid, who, cmd HAVING count(*) > 1
 ), fn AS (
     SELECT p.oid, n.nspname, p.proname, pg_get_function_identity_arguments(p.oid) AS args, p.proconfig,
            p.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a LEFT JOIN exposed e ON e.oid = a.grantee
@@ -75,6 +87,9 @@ WITH RECURSIVE named AS (
     WHERE d.dst <> ALL (r.path || r.node)
 ), view_on_table AS (                            -- every table a view reads, the chain it reads it through, and each
     SELECT r.top AS view_oid, t.rls,                                 -- owner-run view below the top one on that chain
+           t.nspname = 'auth' AND t.relname = 'users' AS auth_users,      -- Supabase's table of every user
+           NOT EXISTS (SELECT 1 FROM unnest(r.path) u(oid) JOIN rel m ON m.oid = u.oid WHERE NOT m.invoker)
+               AS invoker_chain,                     -- every view on the chain, the top one too, reads as the caller
            format('%I.%I', t.nspname, t.relname) || coalesce(' via ' || (
                SELECT string_agg(format('%I.%I', m.nspname, m.relname), ' → ' ORDER BY u.i)
                FROM unnest(r.path[2:]) WITH ORDINALITY u(oid, i) JOIN rel m ON m.oid = u.oid), '') AS base,
@@ -97,7 +112,19 @@ WITH RECURSIVE named AS (
            format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY; then write its policies', r.nspname, r.relname)
     FROM rel r JOIN grants g ON g.oid = r.oid
     WHERE r.relkind IN ('r', 'p') AND NOT r.rls
+      AND NOT EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = r.oid)   -- has policies: policy_exists_rls_disabled
     GROUP BY r.nspname, r.relname
+
+    UNION ALL  -- 1b. policies written, RLS left OFF: they do nothing. If an exposed role can also reach the table, this one
+               --     row says so (rls_off_exposed stays silent: "write its policies" would be the wrong fix)
+    SELECT 1, 'policy_exists_rls_disabled', format('%I.%I', r.nspname, r.relname),
+           'RLS is OFF, so its policies do nothing: '
+               || (SELECT string_agg(quote_ident(p.polname), ', ' ORDER BY p.polname) FROM pg_policy p WHERE p.polrelid = r.oid)
+               || coalesce('; and every row is open to ' || (SELECT string_agg(DISTINCT g.who || ':' || g.priv_desc, ', ')
+                                                              FROM grants g WHERE g.oid = r.oid), ''),
+           format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY;', r.nspname, r.relname)
+    FROM rel r
+    WHERE r.relkind IN ('r', 'p') AND NOT r.rls AND EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = r.oid)
 
     UNION ALL  -- 2. a view that runs as its owner over an RLS table, readable by an exposed role: the policies are skipped
     --         (also through views stacked on views: v2 -> v1 -> secret with only v2 granted)
@@ -106,7 +133,7 @@ WITH RECURSIVE named AS (
                || string_agg(DISTINCT g.who, ', '),
            format('ALTER VIEW %I.%I SET (security_invoker = true);', r.nspname, r.relname)
                || coalesce(' ' || string_agg(DISTINCT vr.fix_below, ' '), '')
-    FROM rel r JOIN view_on_table vr ON vr.view_oid = r.oid AND vr.rls
+    FROM rel r JOIN view_on_table vr ON vr.view_oid = r.oid AND vr.rls AND NOT vr.auth_users   -- that one: check 10
     JOIN grants g ON g.oid = r.oid AND g.priv = 'SELECT'
     WHERE r.relkind = 'v' AND NOT r.invoker
     GROUP BY r.nspname, r.relname
@@ -120,7 +147,7 @@ WITH RECURSIVE named AS (
                || format('ALTER VIEW %I.%I SET (security_invoker = true);', r.nspname, r.relname)
                || coalesce(' ' || string_agg(DISTINCT vr.fix_below, ' '), '')
                || ' then write its policies and grant the view''s readers SELECT on what it reads'
-    FROM rel r JOIN view_on_table vr ON vr.view_oid = r.oid AND NOT vr.rls
+    FROM rel r JOIN view_on_table vr ON vr.view_oid = r.oid AND NOT vr.rls AND NOT vr.auth_users
     JOIN grants g ON g.oid = r.oid AND g.priv = 'SELECT'
     WHERE r.relkind = 'v' AND NOT r.invoker
     GROUP BY r.nspname, r.relname
@@ -131,7 +158,7 @@ WITH RECURSIVE named AS (
                || string_agg(DISTINCT g.who, ', '),
            format('REVOKE SELECT ON %I.%I FROM %s; serve it through a security_invoker view or a checked function',
                   r.nspname, r.relname, string_agg(DISTINCT g.who_sql, ', '))
-    FROM rel r JOIN view_on_table vr ON vr.view_oid = r.oid AND vr.rls
+    FROM rel r JOIN view_on_table vr ON vr.view_oid = r.oid AND vr.rls AND NOT vr.auth_users
     JOIN grants g ON g.oid = r.oid AND g.priv = 'SELECT'
     WHERE r.relkind = 'm'
     GROUP BY r.nspname, r.relname
@@ -159,6 +186,21 @@ WITH RECURSIVE named AS (
     FROM fn f
     WHERE NOT coalesce(EXISTS (SELECT 1 FROM unnest(f.proconfig) s WHERE s LIKE 'search\_path=%'), false)
 
+    UNION ALL  -- 10. a view or materialized view over Supabase's auth.users (every user's email, phone, metadata) that an
+               --     exposed role can read, with an owner-run view or a matview somewhere on the way: every user is served.
+               --     Silent where no auth.users table exists; a chain of security_invoker views needs a grant on auth.users
+    SELECT 1, 'auth_users_exposed', format('%I.%I', r.nspname, r.relname),
+           'reads ' || string_agg(DISTINCT vr.base, ', ')
+               || CASE WHEN r.relkind = 'm' THEN ' into a materialized view (no RLS)'
+                       WHEN NOT r.invoker THEN ' as its owner' ELSE ' through an owner-run view below it' END
+               || '; readable by ' || string_agg(DISTINCT g.who, ', '),
+           format('REVOKE SELECT ON %I.%I FROM %s; serve clients only what they need from a table with RLS (e.g. a profiles table), never auth.users',
+                  r.nspname, r.relname, string_agg(DISTINCT g.who_sql, ', '))
+    FROM rel r JOIN view_on_table vr ON vr.view_oid = r.oid AND vr.auth_users AND NOT vr.invoker_chain
+    JOIN grants g ON g.oid = r.oid AND g.priv = 'SELECT'
+    WHERE r.relkind IN ('v', 'm')
+    GROUP BY r.nspname, r.relname, r.relkind, r.invoker
+
     UNION ALL  -- 7. RLS enabled but not forced, with an owner that does not already bypass it: the owner's queries
                --    (and every SECURITY DEFINER function it owns) skip the policies
     SELECT 2, 'rls_not_forced', format('%I.%I', r.nspname, r.relname),
@@ -174,6 +216,18 @@ WITH RECURSIVE named AS (
     FROM pol p JOIN rel r ON r.oid = p.polrelid
     WHERE regexp_count(p.using_expr || ' ' || p.check_expr, 'auth\.(uid|jwt|role)\(\)')
         > regexp_count(p.using_expr || ' ' || p.check_expr, 'SELECT \(*auth\.(uid|jwt|role)\(\)')
+
+    UNION ALL  -- 11. more than one permissive policy for the same role and command: every row is checked against all of
+               --     them, and a row passes when ANY of them passes — an OR that reads like an AND
+    SELECT 2, 'multiple_permissive_policies',
+           format('%I.%I', r.nspname, r.relname) || ' / ' || o.who || ' / '
+               || string_agg(o.cmd, ', ' ORDER BY array_position(ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE'], o.cmd)),
+           'permissive policies ' || o.policies || ' all apply to ' || o.who || ' for '
+               || string_agg(o.cmd, ', ' ORDER BY array_position(ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE'], o.cmd))
+               || ': each row evaluates every one, and passes if ANY passes (OR, not AND)',
+           'merge them into one policy whose condition ORs theirs; a condition that must ALL hold belongs in a RESTRICTIVE policy'
+    FROM overlap o JOIN rel r ON r.oid = o.polrelid
+    GROUP BY r.nspname, r.relname, o.who, o.policies
 
     UNION ALL  -- 9. RLS on with no policy at all: every non-owner is denied every row — intended, or a forgotten policy?
     SELECT 3, 'rls_without_policies', format('%I.%I', r.nspname, r.relname),

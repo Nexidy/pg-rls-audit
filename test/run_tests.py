@@ -59,6 +59,7 @@ CREATE SCHEMA app AUTHORIZATION {OWNER}; CREATE SCHEMA auth;
 CREATE FUNCTION auth.uid() RETURNS uuid LANGUAGE sql STABLE AS $$ SELECT NULL::uuid $$;
 CREATE FUNCTION auth.jwt() RETURNS jsonb LANGUAGE sql STABLE AS $$ SELECT '{{}}'::jsonb $$;
 GRANT USAGE ON SCHEMA auth TO {OWNER}, {ANON}, {AUTHD};
+CREATE TABLE auth.users (id uuid PRIMARY KEY, email text);   -- Supabase's table of every user, granted to no client
 SET ROLE {OWNER};
 -- clean: RLS on and forced, a wrapped auth.uid()
 CREATE TABLE app.secret (id int, owner_id uuid);
@@ -129,6 +130,51 @@ CREATE TABLE app.contacts_rls (id int, email text, owner_id uuid);
 ALTER TABLE app.contacts_rls ENABLE ROW LEVEL SECURITY; ALTER TABLE app.contacts_rls FORCE ROW LEVEL SECURITY;
 CREATE POLICY own ON app.contacts_rls FOR SELECT TO {ANON} USING (owner_id = (select auth.uid()));
 GRANT SELECT (email) ON app.contacts_rls TO {ANON};
+-- 13 policy_exists_rls_disabled: the policy is written, RLS was never enabled
+CREATE TABLE app.pol_off (id int, owner_id uuid);
+CREATE POLICY own ON app.pol_off FOR SELECT TO {AUTHD} USING (owner_id = (select auth.uid()));
+--    ...and granted to an exposed role too: ONE row that says both, not a second rls_off_exposed ("write its policies")
+CREATE TABLE app.pol_off_granted (id int, owner_id uuid);
+CREATE POLICY own ON app.pol_off_granted FOR SELECT TO {ANON} USING (owner_id = (select auth.uid()));
+GRANT SELECT ON app.pol_off_granted TO {ANON};
+--    clean twin: the same policy and grant with RLS on and forced
+CREATE TABLE app.pol_on (id int, owner_id uuid);
+ALTER TABLE app.pol_on ENABLE ROW LEVEL SECURITY; ALTER TABLE app.pol_on FORCE ROW LEVEL SECURITY;
+CREATE POLICY own ON app.pol_on FOR SELECT TO {ANON} USING (owner_id = (select auth.uid()));
+GRANT SELECT ON app.pol_on TO {ANON};
+-- 14 auth_users_exposed: an owner-run view and a matview over auth.users, granted to exposed roles
+CREATE VIEW app.user_emails AS SELECT id, email FROM auth.users; GRANT SELECT ON app.user_emails TO {ANON};
+CREATE MATERIALIZED VIEW app.user_mv AS SELECT id, email FROM auth.users WITH NO DATA; GRANT SELECT ON app.user_mv TO {AUTHD};
+--    stacked: an owner-run view over a security_invoker one over auth.users; only the top is granted
+CREATE VIEW app.users_inv WITH (security_invoker = true) AS SELECT id, email FROM auth.users;
+CREATE VIEW app.users_top AS SELECT * FROM app.users_inv; GRANT SELECT ON app.users_top TO {AUTHD};
+--    clean twins: a security_invoker view (the caller holds no grant on auth.users), an owner-run view granted to no
+--    exposed role, and a look-alike `users` table outside the auth schema
+CREATE VIEW app.users_safe WITH (security_invoker = true) AS SELECT id, email FROM auth.users;
+GRANT SELECT ON app.users_safe TO {ANON};
+CREATE VIEW app.users_private AS SELECT id, email FROM auth.users;
+CREATE TABLE app.users (id uuid, email text, owner_id uuid);
+ALTER TABLE app.users ENABLE ROW LEVEL SECURITY; ALTER TABLE app.users FORCE ROW LEVEL SECURITY;
+CREATE POLICY own ON app.users FOR SELECT TO {ANON} USING (owner_id = (select auth.uid()));
+CREATE VIEW app.app_users_view AS SELECT id, email FROM app.users; GRANT SELECT ON app.app_users_view TO {ANON};
+-- 15 multiple_permissive_policies: two permissive SELECT policies for one role
+CREATE TABLE app.multi (id int, owner_id uuid, team_id int);
+ALTER TABLE app.multi ENABLE ROW LEVEL SECURITY; ALTER TABLE app.multi FORCE ROW LEVEL SECURITY;
+CREATE POLICY by_owner ON app.multi FOR SELECT TO {AUTHD} USING (owner_id = (select auth.uid()));
+CREATE POLICY by_team ON app.multi FOR SELECT TO {AUTHD} USING (team_id = 1);
+--    a FOR ALL policy overlapping a FOR UPDATE one: reported for UPDATE only
+CREATE TABLE app.multi_all (id int, owner_id uuid, team_id int);
+ALTER TABLE app.multi_all ENABLE ROW LEVEL SECURITY; ALTER TABLE app.multi_all FORCE ROW LEVEL SECURITY;
+CREATE POLICY writer ON app.multi_all FOR ALL TO {ANON} USING (owner_id = (select auth.uid()));
+CREATE POLICY editor ON app.multi_all FOR UPDATE TO {ANON} USING (team_id = 1);
+--    clean twin: a permissive + a RESTRICTIVE policy for one role and command, permissive policies on different
+--    roles, and on different commands
+CREATE TABLE app.multi_ok (id int, owner_id uuid, team_id int);
+ALTER TABLE app.multi_ok ENABLE ROW LEVEL SECURITY; ALTER TABLE app.multi_ok FORCE ROW LEVEL SECURITY;
+CREATE POLICY by_owner ON app.multi_ok FOR SELECT TO {AUTHD} USING (owner_id = (select auth.uid()));
+CREATE POLICY same_team ON app.multi_ok AS RESTRICTIVE FOR SELECT TO {AUTHD} USING (team_id = 1);
+CREATE POLICY anon_read ON app.multi_ok FOR SELECT TO {ANON} USING (team_id = 1);
+CREATE POLICY by_owner_ins ON app.multi_ok FOR INSERT TO {AUTHD} WITH CHECK (owner_id = (select auth.uid()));
 RESET ROLE;
 """
 rc, out = run(["psql", "-X", "-q", "-v", "ON_ERROR_STOP=1", "-d", DB], FIXTURE)
@@ -157,7 +203,15 @@ for check, obj in (("rls_off_exposed", "app.open_tbl"),
                    ("matview_bypasses_rls", "app.mv_stacked"),
                    ("view_bypasses_rls", "app.cyc_b"),
                    ("rls_off_exposed", "app.contacts"),
-                   ("view_bypasses_rls", "app.col_view")):
+                   ("view_bypasses_rls", "app.col_view"),
+                   ("policy_exists_rls_disabled", "app.pol_off"),
+                   ("policy_exists_rls_disabled", "app.pol_off_granted"),
+                   ("auth_users_exposed", "app.user_emails"),
+                   ("auth_users_exposed", "app.user_mv"),
+                   ("auth_users_exposed", "app.users_top"),
+                   ("view_bypasses_rls", "app.app_users_view"),
+                   ("multiple_permissive_policies", f"app.multi / {AUTHD} / SELECT"),
+                   ("multiple_permissive_policies", f"app.multi_all / {ANON} / UPDATE")):
     case(f"⭐ finds {check} on {obj}", (check, obj) in found, sorted(found))
 
 flagged = {o.split(" / ")[0].split("(")[0] for _, o in found}
@@ -183,6 +237,27 @@ case("⭐ rls_off_via_view comes with its fix: enable RLS on app.plain, make the
      "ALTER TABLE app.plain ENABLE ROW LEVEL SECURITY;" in off[4]
      and "ALTER VIEW app.plain_view SET (security_invoker = true);" in off[4], off)
 case("⭐ every finding comes with a fix", found and all(r[4].strip() for r in rows.values()), sorted(rows))
+both = rows.get(("policy_exists_rls_disabled", "app.pol_off_granted"), [""] * 5)
+case("⭐ policies on an RLS-off table that is also granted: one row naming the policy AND the grant, one fix",
+     ("rls_off_exposed", "app.pol_off_granted") not in found and "own" in both[3] and f"{ANON}:SELECT" in both[3]
+     and both[4] == "ALTER TABLE app.pol_off_granted ENABLE ROW LEVEL SECURITY;", (both, sorted(found)))
+case("⛔ policies on a table with RLS on and forced are not policy_exists_rls_disabled", "app.pol_on" not in flagged,
+     sorted(found))
+case("⛔ auth.users behind a security_invoker view, an ungranted view, or a look-alike app.users is not auth_users_exposed",
+     not ({"app.users_safe", "app.users_private", "app.users_inv", "app.users", "auth.users"} & flagged)
+     and ("auth_users_exposed", "app.app_users_view") not in found, sorted(found))
+case("⛔ a view over auth.users is reported once, as auth_users_exposed, not again as an RLS bypass",
+     [c for c, o in found if o == "app.user_emails"] == ["auth_users_exposed"]
+     and [c for c, o in found if o == "app.user_mv"] == ["auth_users_exposed"], sorted(found))
+top = rows.get(("auth_users_exposed", "app.users_top"), [""] * 5)
+case("⭐ auth_users_exposed names the chain and revokes the grant: app.users_top → app.users_inv → auth.users",
+     "auth.users via app.users_inv" in top[3] and f"REVOKE SELECT ON app.users_top FROM {AUTHD}" in top[4], top)
+multi = rows.get(("multiple_permissive_policies", f"app.multi / {AUTHD} / SELECT"), [""] * 5)
+case("⭐ multiple_permissive_policies names the policies, the role and the command",
+     "by_owner, by_team" in multi[3] and AUTHD in multi[3] and "SELECT" in multi[3], multi)
+case("⛔ FOR ALL + FOR UPDATE overlap only on UPDATE; permissive + restrictive, different roles or commands are fine",
+     "app.multi_ok" not in flagged and sorted(o for c, o in found if c == "multiple_permissive_policies")
+     == sorted([f"app.multi / {AUTHD} / SELECT", f"app.multi_all / {ANON} / UPDATE"]), sorted(found))
 case("⛔ a wrapped (select auth.uid()) is not a per-row call", ("policy_per_row_auth_call", "app.secret / own") not in found,
      sorted(found))
 rc2, out2 = run(["psql", "-X", "-q", "-A", "-t", "-F", "|", "-v", f"exposed_roles=pga_typo_{tag}", "-d", DB], sql)
