@@ -44,6 +44,53 @@ be reported — and a table with policies, RLS off and a grant, reported once, n
 
 By [Nexidy](https://nexidy.com).
 
+## A real run: Nexidy's own production database
+
+Run on 2026-11-13 against the PostgreSQL database Nexidy's own platform runs on (PostgreSQL 18.6; 115 tables, 35
+of them with row-level security, 60 policies, 58 `SECURITY DEFINER` functions), with the first command above and no
+options. Every schema, table and policy name below is replaced; everything else is the tool's output as printed.
+
+Only processes on the same machine can reach this database (no TCP listener; a local socket with peer
+authentication), and no end user holds a role in it. So no role here is untrusted in this tool's sense, and the
+default `anon,authenticated` do not exist, which is what the first two rows say.
+
+| Severity | Check | Object | Detail | Fix |
+|---|---|---|---|---|
+| HIGH | `exposed_role_missing` | `anon` | no such role: nothing it can reach was checked | `pass -v exposed_roles=<existing roles>` |
+| HIGH | `exposed_role_missing` | `authenticated` | no such role: nothing it can reach was checked | `pass -v exposed_roles=<existing roles>` |
+| HIGH | `policy_always_true` | `schema_a.table_01 / policy_01` | USING (true) on a permissive policy that applies to an exposed role | scope the condition (e.g. owner_id = (select auth.uid())), or make it RESTRICTIVE, or drop it |
+| HIGH | `policy_always_true` | `schema_a.table_02 / policy_01` | USING (true) on a permissive policy that applies to an exposed role | scope the condition (e.g. owner_id = (select auth.uid())), or make it RESTRICTIVE, or drop it |
+| MEDIUM | `multiple_permissive_policies` | `schema_b.table_03 / PUBLIC / INSERT` | permissive policies policy_02, policy_03 all apply to PUBLIC for INSERT: each row evaluates every one, and passes if ANY passes (OR, not AND) | merge them into one policy whose condition ORs theirs; a condition that must ALL hold belongs in a RESTRICTIVE policy |
+| MEDIUM | `multiple_permissive_policies` | `schema_b.table_04 / PUBLIC / INSERT` | permissive policies policy_04, policy_05 all apply to PUBLIC for INSERT: each row evaluates every one, and passes if ANY passes (OR, not AND) | merge them into one policy whose condition ORs theirs; a condition that must ALL hold belongs in a RESTRICTIVE policy |
+| MEDIUM | `multiple_permissive_policies` | `schema_b.table_05 / PUBLIC / INSERT` | permissive policies policy_06, policy_07 all apply to PUBLIC for INSERT: each row evaluates every one, and passes if ANY passes (OR, not AND) | merge them into one policy whose condition ORs theirs; a condition that must ALL hold belongs in a RESTRICTIVE policy |
+| MEDIUM | `multiple_permissive_policies` | `schema_c.table_06 / PUBLIC / INSERT` | permissive policies policy_08, policy_09 all apply to PUBLIC for INSERT: each row evaluates every one, and passes if ANY passes (OR, not AND) | merge them into one policy whose condition ORs theirs; a condition that must ALL hold belongs in a RESTRICTIVE policy |
+| MEDIUM | `multiple_permissive_policies` | `schema_c.table_07 / PUBLIC / INSERT` | permissive policies policy_08, policy_09 all apply to PUBLIC for INSERT: each row evaluates every one, and passes if ANY passes (OR, not AND) | merge them into one policy whose condition ORs theirs; a condition that must ALL hold belongs in a RESTRICTIVE policy |
+| MEDIUM | `multiple_permissive_policies` | `schema_c.table_08 / PUBLIC / INSERT` | permissive policies policy_08, policy_09 all apply to PUBLIC for INSERT: each row evaluates every one, and passes if ANY passes (OR, not AND) | merge them into one policy whose condition ORs theirs; a condition that must ALL hold belongs in a RESTRICTIVE policy |
+| MEDIUM | `multiple_permissive_policies` | `schema_c.table_09 / PUBLIC / INSERT` | permissive policies policy_08, policy_09 all apply to PUBLIC for INSERT: each row evaluates every one, and passes if ANY passes (OR, not AND) | merge them into one policy whose condition ORs theirs; a condition that must ALL hold belongs in a RESTRICTIVE policy |
+| MEDIUM | `multiple_permissive_policies` | `schema_c.table_10 / PUBLIC / INSERT` | permissive policies policy_08, policy_09 all apply to PUBLIC for INSERT: each row evaluates every one, and passes if ANY passes (OR, not AND) | merge them into one policy whose condition ORs theirs; a condition that must ALL hold belongs in a RESTRICTIVE policy |
+| MEDIUM | `rls_not_forced` | `schema_d.table_11` | RLS is on but not FORCED; the table owner and its SECURITY DEFINER functions are exempt | `ALTER TABLE schema_d.table_11 FORCE ROW LEVEL SECURITY;` |
+| MEDIUM | `rls_not_forced` | `schema_b.table_12` | RLS is on but not FORCED; the table owner and its SECURITY DEFINER functions are exempt | `ALTER TABLE schema_b.table_12 FORCE ROW LEVEL SECURITY;` |
+| MEDIUM | `rls_not_forced` | `schema_b.table_13` | RLS is on but not FORCED; the table owner and its SECURITY DEFINER functions are exempt | `ALTER TABLE schema_b.table_13 FORCE ROW LEVEL SECURITY;` |
+| MEDIUM | `rls_not_forced` | `schema_b.table_14` | RLS is on but not FORCED; the table owner and its SECURITY DEFINER functions are exempt | `ALTER TABLE schema_b.table_14 FORCE ROW LEVEL SECURITY;` |
+| MEDIUM | `rls_not_forced` | `schema_b.table_15` | RLS is on but not FORCED; the table owner and its SECURITY DEFINER functions are exempt | `ALTER TABLE schema_b.table_15 FORCE ROW LEVEL SECURITY;` |
+| MEDIUM | `rls_not_forced` | `schema_e.table_16` | RLS is on but not FORCED; the table owner and its SECURITY DEFINER functions are exempt | `ALTER TABLE schema_e.table_16 FORCE ROW LEVEL SECURITY;` |
+| MEDIUM | `rls_not_forced` | `schema_f.table_17` | RLS is on but not FORCED; the table owner and its SECURITY DEFINER functions are exempt | `ALTER TABLE schema_f.table_17 FORCE ROW LEVEL SECURITY;` |
+| MEDIUM | `rls_not_forced` | `schema_f.table_18` | RLS is on but not FORCED; the table owner and its SECURITY DEFINER functions are exempt | `ALTER TABLE schema_f.table_18 FORCE ROW LEVEL SECURITY;` |
+| MEDIUM | `rls_not_forced` | `schema_g.table_19` | RLS is on but not FORCED; the table owner and its SECURITY DEFINER functions are exempt | `ALTER TABLE schema_g.table_19 FORCE ROW LEVEL SECURITY;` |
+| LOW | `rls_without_policies` | `schema_c.table_20` | RLS is on and the table has no policies: non-owners see nothing | if clients should read it, write the policy; if not, this is fine |
+
+The run's last result set: 35 tables with RLS, 115 tables, 60 policies, 58 `SECURITY DEFINER` functions.
+
+**Our reading of it**
+
+- `exposed_role_missing` (2): expected here, for the reason above. On a Supabase project these two roles exist and
+  every exposure check runs against them.
+- `policy_always_true` (2): by design. Both tables hold records that are public on purpose, readable by everyone.
+  RLS is on and forced on both; an insert passes only for an operator, or on one of them for the row's own author,
+  and updates and deletes are granted to the owner role alone.
+- `multiple_permissive_policies` (8), `rls_not_forced` (9), `rls_without_policies` (1): open, filed for our own
+  next pass: policy pairs to merge into one per command, tables to `FORCE`, and one table to confirm.
+
 ## Run the tests
 
 `test/run_tests.py` builds a scratch database with one planted defect per check (and a clean look-alike beside each
